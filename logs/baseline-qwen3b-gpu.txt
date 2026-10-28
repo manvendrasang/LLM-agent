@@ -1,0 +1,93 @@
+
+
+Loading model... 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11429-d812350493
+model      : models/gguf/qwen2.5-coder-3b-instruct-q4_k_m.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> Write a Python function that implements exponential backoff with a maximum number of retries. Include type hints, error handling, and unit tests.
+Here's a Python function that implements exponential backoff with a maximum number of retries, along with type hints, error handling, and unit tests:
+
+```python
+import time
+
+def exponential_backoff_with_retries(
+    func: callable,
+    max_retries: int = 5,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    jitter: float = 0.5
+) -> callable:
+    """
+    Decorator to implement exponential backoff with a maximum number of retries.
+
+    :param func: The function to be decorated.
+    :param max_retries: The maximum number of retries.
+    :param initial_delay: The initial delay in seconds.
+    :param backoff_factor: The factor by which the delay is multiplied after each retry.
+    :param jitter: The amount of random jitter to add to the delay.
+    :return: The decorated function.
+    """
+    def wrapper(*args, **kwargs):
+        retries = 0
+        while retries < max_retries:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                retries += 1
+                delay = initial_delay * (backoff_factor ** retries) + jitter * (2 * random.random() - 1)
+                print(f"Attempt {retries} failed. Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+        raise Exception(f"Failed to execute {func.__name__} after {max_retries} retries.")
+    return wrapper
+
+# Unit tests
+import unittest
+import random
+
+class TestExponentialBackoffWithRetries(unittest.TestCase):
+    def test_exponential_backoff_with_retries(self):
+        @exponential_backoff_with_retries(max_retries=3, initial_delay=0.5, backoff_factor=2.0, jitter=0.5)
+        def failing_function():
+            raise Exception("Simulated failure")
+
+        with self.assertRaises(Exception):
+            failing_function()
+
+        @exponential_backoff_with_retries(max_retries=3, initial_delay=0.5, backoff_factor=2.0, jitter=0.5)
+        def successful_function():
+            return "Success"
+
+        self.assertEqual(successful_function(), "Success")
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+### Explanation:
+
+1. **Function Definition**: The `exponential_backoff_with_retries` function is a decorator that takes a function `func`
+
+[ Prompt: 770.3 t/s | Generation: 67.3 t/s ]
+
+
+Exiting...

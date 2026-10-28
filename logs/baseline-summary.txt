@@ -1,0 +1,4 @@
+build      : b11429-d812350493
+model      : models/gguf/qwen2.5-coder-3b-instruct-q4_k_m.gguf
+ftype      : Q4_K - Medium
+[ Prompt: 770.3 t/s | Generation: 67.3 t/s ]
