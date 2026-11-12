@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,8 +46,19 @@ class TaskStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3.Connection as a context manager only scopes the transaction;
+        # the handle itself has to be closed explicitly.
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as db:
+        with self._connection() as db:
             db.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY,
@@ -87,7 +100,7 @@ class TaskStore:
         task_id = uuid.uuid4().hex
         now = utc_now()
 
-        with self._connect() as db:
+        with self._connection() as db:
             db.execute(
                 """
                 INSERT INTO tasks (
@@ -103,7 +116,7 @@ class TaskStore:
         return task
 
     def get_task(self, task_id: str) -> TaskRecord | None:
-        with self._connect() as db:
+        with self._connection() as db:
             row = db.execute(
                 "SELECT * FROM tasks WHERE task_id = ?",
                 (task_id,),
@@ -115,7 +128,7 @@ class TaskStore:
         if status is not None and status not in STATUSES:
             raise ValueError(f"Invalid task status: {status}")
 
-        with self._connect() as db:
+        with self._connection() as db:
             if status is None:
                 rows = db.execute(
                     "SELECT * FROM tasks ORDER BY created_at, task_id"
@@ -144,7 +157,7 @@ class TaskStore:
             raise ValueError(f"Invalid task status: {status}")
 
         now = utc_now()
-        with self._connect() as db:
+        with self._connection() as db:
             cursor = db.execute(
                 """
                 UPDATE tasks
@@ -169,7 +182,7 @@ class TaskStore:
         serialized = json.dumps(checkpoint, ensure_ascii=False)
         now = utc_now()
 
-        with self._connect() as db:
+        with self._connection() as db:
             cursor = db.execute(
                 """
                 UPDATE tasks

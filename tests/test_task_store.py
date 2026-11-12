@@ -1,8 +1,22 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from agent.task_store import TaskStore
+
+
+class RecordingStore(TaskStore):
+    """TaskStore that keeps every connection it opens."""
+
+    def __init__(self, db_path):
+        self.connections = []
+        super().__init__(db_path)
+
+    def _connect(self):
+        connection = super()._connect()
+        self.connections.append(connection)
+        return connection
 
 
 class TaskStoreTests(unittest.TestCase):
@@ -78,6 +92,30 @@ class TaskStoreTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.store.list_tasks(status="unknown")
+
+    def test_connections_are_closed_after_each_operation(self):
+        store = RecordingStore(self.db_path)
+        task = store.create_task("Close my connections")
+        store.save_checkpoint(task.task_id, {"step": 1})
+        store.update_status(task.task_id, "completed", result="done")
+        store.get_task(task.task_id)
+        store.list_tasks(status="completed")
+
+        self.assertGreater(len(store.connections), 1)
+        for connection in store.connections:
+            with self.subTest(connection=id(connection)):
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+
+    def test_failed_operation_still_closes_connection(self):
+        store = RecordingStore(self.db_path)
+
+        with self.assertRaises(KeyError):
+            store.update_status("missing-task-id", "failed")
+
+        self.assertTrue(store.connections)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            store.connections[-1].execute("SELECT 1")
 
     def test_list_tasks_can_filter_by_status(self):
         queued = self.store.create_task("Queued task")
