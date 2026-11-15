@@ -224,3 +224,4 @@ __marimo__/
 
 # Local agent runtime state
 data/*.sqlite3
+state/*.sqlite3
