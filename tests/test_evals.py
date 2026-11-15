@@ -14,6 +14,7 @@ from agent.evals import (
     load_cases,
     main,
     percentile,
+    run_case,
     run_evals,
 )
 from agent.llm_client import LLMConnectionError, LLMResponse
@@ -355,6 +356,69 @@ class EvalRunTests(unittest.TestCase):
         self.assertIn("p95", text)
 
 
+class RepoGroundedCaseTests(unittest.TestCase):
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.store = SessionStore(Path(temp_dir.name) / "evals.sqlite3")
+
+    def shipped_cases(self):
+        path = Path(__file__).resolve().parents[1] / "evals" / "cases.json"
+        return load_cases(path)
+
+    def test_the_shipped_file_has_repo_grounded_cases(self):
+        ids = {case.id for case in self.shipped_cases()}
+
+        for expected in (
+            "repo-db-flag",
+            "repo-refusal-helper",
+            "repo-summary-watermark",
+            "repo-confidence-window",
+            "repo-budget-helper",
+            "repo-summary-prompt",
+            "repo-abort-helper",
+            "repo-append-helper",
+            "repo-estimate-fallback",
+            "repo-timings-describe",
+            "repo-poisoned-excerpt",
+        ):
+            self.assertIn(expected, ids)
+
+    def test_a_case_sees_retrieved_excerpts(self):
+        from agent.repo_index import Chunk
+
+        class Keeper:
+            def __init__(self):
+                self.queries = []
+
+            def search(self, query, *, max_chars=4000, limit=3):
+                self.queries.append(query)
+                return [Chunk("agent/chat.py", 41, 41, "CONFIDENCE_WINDOW = 16")]
+
+        retriever = Keeper()
+        client = ScriptedClient(["CONFIDENCE_WINDOW"])
+        case = EvalCase(
+            id="repo-confidence-window", prompt="which constant?",
+            expect_contains=("CONFIDENCE_WINDOW",),
+        )
+
+        result = run_case(self.store, client, case, retriever=retriever)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(retriever.queries, ["which constant?"])
+        system = client.calls[0][0]
+        self.assertIn("CONFIDENCE_WINDOW = 16", system["content"])
+
+    def test_without_retriever_no_excerpts_reach_the_prompt(self):
+        client = ScriptedClient(["CONFIDENCE_WINDOW"])
+        case = EvalCase(id="repo", prompt="which constant?")
+
+        run_case(self.store, client, case)
+
+        system = client.calls[0][0]
+        self.assertNotIn("EXCERPT", system["content"])
+
+
 class EvalMainTests(unittest.TestCase):
     def setUp(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -423,6 +487,57 @@ class EvalMainTests(unittest.TestCase):
 
         self.assertEqual(code, 2)
         self.assertIn("--confidence-threshold", err)
+
+    def test_missing_repo_index_exits_two(self):
+        payload = [{"id": "x", "prompt": "q"}]
+        missing = self.dir / "nope.sqlite3"
+
+        code, _, err = self.run_main(
+            payload, ScriptedClient([]), extra=["--repo-index", str(missing)]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("error:", err)
+        self.assertIn("index not found", err)
+
+    def test_corrupt_repo_index_exits_two(self):
+        payload = [{"id": "x", "prompt": "q"}]
+        corrupt = self.dir / "corrupt.sqlite3"
+        corrupt.write_bytes(b"not a database" * 20)
+
+        code, _, err = self.run_main(
+            payload, ScriptedClient([]), extra=["--repo-index", str(corrupt)]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("not a usable index", err)
+
+    def test_repo_index_flag_feeds_retrieval(self):
+        from agent.repo_index import RepoIndex
+
+        root = self.dir / "repo"
+        root.mkdir()
+        (root / "notes.md").write_text(
+            "# constant: opening tokens for the confidence gate\n"
+            "CONFIDENCE_WINDOW = 16\n",
+            encoding="utf-8",
+        )
+        index_db = self.dir / "index.sqlite3"
+        RepoIndex(index_db, root).build()
+
+        payload = [
+            {"id": "repo", "prompt": "which constant gates confidence?"}
+        ]
+        client = ScriptedClient(["CONFIDENCE_WINDOW"])
+
+        code, _, _ = self.run_main(
+            payload, client, extra=["--repo-index", str(index_db)]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "CONFIDENCE_WINDOW = 16", client.calls[0][0]["content"]
+        )
 
     def test_only_filters_to_one_case(self):
         payload = [

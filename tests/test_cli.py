@@ -105,6 +105,17 @@ class ChatCliTests(unittest.TestCase):
         session = SessionStore(self.db).list_sessions()[0]
         self.assertEqual(len(SessionStore(self.db).messages(session.session_id)), 2)
 
+    def test_missing_repo_index_exits_two(self):
+        client = CliClient(reply="never used")
+
+        code, _, err = self.run_cli(
+            ["--repo-index", self.db + ".missing"], [], client
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("index not found", err)
+        self.assertEqual(client.stream_calls, 0)
+
     def test_no_stream_flag_uses_buffered_request(self):
         client = CliClient(reply="buffered")
         code, out, _ = self.run_cli(

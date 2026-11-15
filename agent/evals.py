@@ -245,6 +245,7 @@ def run_case(
     max_tokens: int = 512,
     temperature: float = 0.0,
     confidence_threshold: float | None = None,
+    retriever: object | None = None,
 ) -> CaseResult:
     try:
         chat = ChatSession(
@@ -255,6 +256,7 @@ def run_case(
             max_tokens=max_tokens,
             temperature=temperature,
             confidence_threshold=confidence_threshold,
+            retriever=retriever,
         )
         result = chat.send(case.prompt)
     except (LLMClientError, ValueError) as exc:
@@ -421,6 +423,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--timeout", type=float, default=120.0, help="request timeout in seconds"
     )
     parser.add_argument(
+        "--repo-index", default=None, metavar="DB",
+        help="retrieve repo excerpts from this FTS5 index during the runs",
+    )
+    parser.add_argument(
         "--confidence-threshold", type=float, default=None, metavar="P",
         help=(
             "hedge instead of answering when the opening tokens' "
@@ -468,8 +474,22 @@ def main(
         print("error: --confidence-threshold must be in (0, 1]", file=sys.stderr)
         return 2
 
+    retriever = None
+    if args.repo_index is not None:
+        from agent.repo_index import IndexUnavailableError, open_index
+
+        try:
+            retriever = open_index(args.repo_index)
+        except IndexUnavailableError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        reason = retriever.stale_reason()
+        if reason is not None:
+            print(f"warning: {reason}", file=sys.stderr)
+
     store = SessionStore(args.db)
     settings = dict(
+        retriever=retriever,
         system_prompt=args.system,
         context_tokens=args.context_tokens,
         max_tokens=args.max_tokens,
