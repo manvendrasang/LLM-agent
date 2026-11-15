@@ -15,6 +15,9 @@ checkpoint saved after each one so an interrupted run resumes where it stopped.
 | `agent/llm_client.py` | `LocalLLMClient`: sync `/v1/chat/completions` over `urllib`, stdlib only |
 | `agent/task_store.py` | `TaskStore`: SQLite task records (`queued/running/completed/failed`) + JSON checkpoints |
 | `agent/runner.py` | `TaskRunner`: drives a stored task through model calls, checkpointing every step |
+| `agent/chat.py` | `ChatSession`: streaming chat turns with a budgeted context window and per-turn timings |
+| `agent/session_store.py` | `SessionStore`: `sessions` and `messages` tables for chat history |
+| `agent/db.py` | Shared SQLite connection/transaction helpers |
 | `tests/` | `unittest` suite for both modules |
 | `models/gguf/` | Local GGUF weights (gitignored) |
 | `logs/` | Baseline captures: hardware, llama.cpp build, throughput |
@@ -26,6 +29,12 @@ checkpoint saved after each one so an interrupted run resumes where it stopped.
 - Python 3.10+ (the test suite passes on 3.14; no third-party packages needed)
 - `llama-server` from llama.cpp on `PATH`
 - A GGUF model — currently `models/gguf/qwen2.5-coder-3b-instruct-q4_k_m.gguf` (2.1 GB, Q4_K_M)
+
+This is a coding model on purpose: the project's use is code work, where it beats
+same-size general instruct models. A general 3B (e.g. Llama-3.2-3B-Instruct) is
+the better choice for open-ended chat and the worse one for code. Only one 3B
+fits in 4 GB of VRAM at a time, so installed models are swapped rather than
+served together.
 
 The `cuda/` directory is a separate Python 3.11 virtualenv with CUDA-enabled
 PyTorch, used only for `first.ipynb`. It is not needed by `agent/` or the tests:
@@ -43,7 +52,8 @@ llama-server \
   --port 8080 \
   --alias qwen2.5-coder-3b \
   --n-gpu-layers 99 \
-  --ctx-size 4096
+  --ctx-size 8192 \
+  --parallel 1
 ```
 
 - **`--port 8080` matters.** This llama.cpp build defaults to port 9931, while
@@ -51,6 +61,10 @@ llama-server \
   as above or point the client somewhere else with `LLM_BASE_URL`.
 - `--n-gpu-layers 99` offloads everything to the GPU. On a 4 GB card use `0` for
   CPU-only, or a smaller number to partially offload.
+- `--ctx-size 8192 --parallel 1` gives one 8K-token conversation instead of four
+  4K slots; the default split divides context across slots, which caps every
+  single-user request at 4096 tokens. The model was trained at 32K, so 8K is well
+  inside its range. Measured with this model: ~2.3 GB of the 4 GB VRAM.
 - `--alias` sets the model ID reported by `/v1/models`; the client otherwise
   accepts whatever the server reports.
 
@@ -168,18 +182,121 @@ print(result.task.status)  # "completed"
 - A task already `completed` is returned without contacting the model.
 - A checkpoint that cannot be read (wrong types) restarts the task from step 0.
 
+## Chat sessions
+
+`ChatSession` keeps a streaming conversation in SQLite inside the model's context
+window:
+
+```python
+import logging
+
+from agent.chat import ChatSession
+from agent.llm_client import LocalLLMClient
+from agent.session_store import SessionStore
+
+logging.basicConfig(level=logging.INFO)
+
+store = SessionStore("state/chat.sqlite3")
+client = LocalLLMClient(timeout_seconds=180)
+chat = ChatSession(
+    store,
+    client,
+    system_prompt="You are a concise Python assistant.",
+    context_tokens=8192,   # must match llama-server --ctx-size
+    max_tokens=512,        # reserved for the reply
+)
+
+result = chat.send("How do I reverse a list in place?")
+print(result.text)
+print(result.timings.describe())
+```
+
+Every turn logs one line on the `agent.chat` logger:
+
+```
+turn session=4f3c... messages=3 dropped=0 prompt_ms=5.7 summary_ms=0.0 first_token_ms=412.8
+generation_ms=3104.5 python_ms=25.6 total_ms=3520.3 prompt_tokens=1485 completion_tokens=187 tok_s=60.2 stream=True
+```
+
+- **Budget**: `context_tokens - max_tokens` is spent on the system prompt, the
+  summary and the newest turns, in that order. Older turns are dropped rather
+  than truncated mid-message.
+- **Real token counts**: `ChatSession` asks the server for exact numbers —
+  `count_tokens()` uses `/tokenize` and `count_prompt_tokens()` renders the chat
+  template with `/apply-template` before counting. `send()` puts the new turn
+  into the candidate context *in memory*, counts that rendered prompt once, and
+  sends the very context it measured: the size check and the request share one
+  count. Trimming a turn away costs one further count per dropped message, and a
+  turn that fits costs exactly one (~5–20 ms). Per-text counts are cached.
+  This matters for code: measured on the bundled model, dense Python is about
+  **2.6–3.3 characters per token**, so the `estimate_tokens` fallback (4 chars per
+  token) undercounts a code-heavy turn by roughly 20–50%. `estimate_tokens` is
+  only used when the client has no tokenizer endpoints.
+- **Oversized messages** are refused with `ValueError` before being stored, so a
+  huge paste cannot poison every later turn in the session. A rejected turn
+  writes nothing at all — not the message, and not a summary computed for it.
+- **Summary**: once anything is dropped, the dropped turns are summarised into
+  the session's `summary` column (one extra model call) and injected above the
+  history. A failed summary logs a warning and the turn still answers. Summary
+  time is reported as `summary_ms` and excluded from `python_ms`, so the log
+  still separates harness cost from model cost.
+- **Summarised once**: the session stores a `summarised_until` message id, and a
+  turn only ever summarises messages above that watermark. As the window slides,
+  already-folded turns are never summarised again — each turn is folded in
+  exactly once, in incremental batches.
+- **Failures leave nothing behind**: if the request fails (connection, timeout,
+  HTTP error) or is interrupted (Ctrl+C mid-reply), the user message written for
+  that turn is deleted again before the exception propagates, so a session never
+  ends with an unanswered prompt. In the CLI an interrupted reply prints
+  `[cancelled]` and the session stays usable.
+- **Streaming**: `chat.send(text)` streams; pass `stream=False` for a single
+  buffered request. `client.chat_stream(...)` is the lower-level iterator and
+  exposes `.text`, `.first_token_seconds` and usage after it is consumed.
+- **Message ids** are stable across restarts, so a session can be resumed from
+  its `session_id` with another `ChatSession(...)`.
+- **Summaries are budgeted too**: the dropped transcript is trimmed to fit the
+  summary request, keeping the most recent part (older material is already in
+  the previous summary). Without this, a large dropped block would exceed the
+  model window and the summary would fail with HTTP 400.
+
+### Terminal chat
+
+```bash
+python -m agent.chat                                              # new session
+python -m agent.chat --session <id> --max-tokens 400              # resume
+python -m agent.chat --list                                       # recent sessions
+```
+
+Replies stream to the terminal and every turn ends with the timing line:
+
+```
+you> how do I reverse a list?
+agent> Use `lst.reverse()` for in place ...
+[prompt_ms=6.1 summary_ms=0.0 first_token_ms=48.2 generation_ms=912.4 python_ms=26.3
+total_ms=993.0 prompt_tokens=57 completion_tokens=84 tok_s=92.1 stream=True]
+```
+
+Commands: `/help`, `/new`, `/session`, `/exit` (Ctrl+D also quits). Useful flags:
+`--db` (default `state/chat.sqlite3`), `--session`, `--system`,
+`--context-tokens` (must match `llama-server --ctx-size`), `--max-tokens`,
+`--temperature`, `--base-url`, `--model`, `--timeout`, `--no-stream`, `--list`.
+
 ## Run the tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-25 tests, no network or model required — the client tests start a local mock
-HTTP server on an ephemeral port and the runner tests use a fake client. To run
-a single module:
+81 tests, no network or model required — the client and streaming tests start a
+local mock HTTP server on an ephemeral port, and the runner/chat/CLI tests use a
+fake client. To run a single module:
 
 ```bash
 python3 -m unittest tests.test_llm_client -v
+python3 -m unittest tests.test_streaming -v
 python3 -m unittest tests.test_task_store -v
+python3 -m unittest tests.test_session_store -v
 python3 -m unittest tests.test_runner -v
+python3 -m unittest tests.test_chat -v
+python3 -m unittest tests.test_cli -v
 ```

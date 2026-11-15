@@ -16,6 +16,9 @@ from agent.llm_client import (
 class MockHandler(BaseHTTPRequestHandler):
     mode = "success"
     last_request = None
+    tokenize_calls = 0
+    template_calls = 0
+    template_body = None
 
     def log_message(self, format, *args):
         pass
@@ -44,9 +47,29 @@ class MockHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        MockHandler.last_request = json.loads(
-            self.rfile.read(length).decode("utf-8")
-        )
+        raw = self.rfile.read(length).decode("utf-8")
+
+        if self.path == "/tokenize":
+            MockHandler.tokenize_calls += 1
+            content = json.loads(raw)["content"]
+            self.respond(200, {"tokens": list(range(len(content.split())))})
+            return
+
+        if self.path == "/apply-template":
+            MockHandler.template_calls += 1
+            if MockHandler.template_body is not None:
+                self.respond(200, MockHandler.template_body)
+                return
+            messages = json.loads(raw)["messages"]
+            prompt = "".join(
+                f"<|im_start|>{message['role']}\n"
+                f"{message['content']}<|im_end|>\n"
+                for message in messages
+            )
+            self.respond(200, {"prompt": prompt})
+            return
+
+        MockHandler.last_request = json.loads(raw)
 
         if MockHandler.mode == "http_error":
             self.respond(500, {"error": "mock failure"})
@@ -105,6 +128,9 @@ class LLMClientTests(unittest.TestCase):
     def setUp(self):
         MockHandler.mode = "success"
         MockHandler.last_request = None
+        MockHandler.tokenize_calls = 0
+        MockHandler.template_calls = 0
+        MockHandler.template_body = None
         self.client = LocalLLMClient(
             base_url=self.base_url,
             timeout_seconds=1.0,
@@ -165,6 +191,36 @@ class LLMClientTests(unittest.TestCase):
                 [{"role": "user", "content": "test"}],
                 max_tokens=0,
             )
+
+    def test_count_tokens_uses_server_tokenizer_and_caches(self):
+        self.assertEqual(self.client.count_tokens("a b c"), 3)
+        self.assertEqual(self.client.count_tokens("a b c"), 3)
+        self.assertEqual(MockHandler.tokenize_calls, 1)
+
+        self.assertEqual(self.client.count_tokens("other words"), 2)
+        self.assertEqual(MockHandler.tokenize_calls, 2)
+
+    def test_count_tokens_rejects_non_strings(self):
+        with self.assertRaises(ValueError):
+            self.client.count_tokens(None)
+
+    def test_count_prompt_tokens_renders_the_chat_template(self):
+        # The mock tokenizer splits on whitespace, so the rendered ChatML
+        # "<|im_start|>user\nhi<|im_end|>\n" is two tokens.
+        count = self.client.count_prompt_tokens([
+            {"role": "user", "content": "hi"}
+        ])
+
+        self.assertEqual(count, 2)
+        self.assertEqual(MockHandler.template_calls, 1)
+
+    def test_template_failure_is_a_response_error(self):
+        MockHandler.template_body = {"nope": True}
+
+        with self.assertRaises(LLMResponseError):
+            self.client.count_prompt_tokens([
+                {"role": "user", "content": "hi"}
+            ])
 
 
 if __name__ == "__main__":

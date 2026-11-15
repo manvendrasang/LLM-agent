@@ -6,16 +6,13 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.db import open_connection, transaction, utc_now
+
 
 STATUSES = {"queued", "running", "completed", "failed"}
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass(frozen=True)
@@ -39,23 +36,14 @@ class TaskStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.db_path,
-            timeout=10.0,
-        )
-        connection.row_factory = sqlite3.Row
-        return connection
+        return open_connection(self.db_path)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        # sqlite3.Connection as a context manager only scopes the transaction;
-        # the handle itself has to be closed explicitly.
-        connection = self._connect()
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        # transaction() scopes the commit and closes the handle afterwards;
+        # sqlite3.Connection alone would only scope the transaction.
+        with transaction(self._connect()) as connection:
+            yield connection
 
     def _initialize(self) -> None:
         with self._connection() as db:
