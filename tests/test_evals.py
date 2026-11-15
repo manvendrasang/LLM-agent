@@ -8,6 +8,7 @@ from pathlib import Path
 from agent.evals import (
     EvalCase,
     evaluate,
+    format_comparison,
     format_summary,
     is_refusal,
     load_cases,
@@ -15,14 +16,15 @@ from agent.evals import (
     percentile,
     run_evals,
 )
-from agent.llm_client import LLMConnectionError
+from agent.llm_client import LLMConnectionError, LLMResponse
 from agent.session_store import SessionStore
 
 
 class FakeStream:
-    def __init__(self, text, first=0.02, latency=0.06):
+    def __init__(self, text, first=0.02, latency=0.06, token_logprobs=()):
         self._text = text
         self.text = ""
+        self.token_logprobs = tuple(token_logprobs)
         self.model = "fake-model"
         self.prompt_tokens = 10
         self.completion_tokens = 4
@@ -39,19 +41,33 @@ class FakeStream:
 
 
 class ScriptedClient:
-    """Returns one scripted reply per case, in order."""
+    """Returns one scripted reply per request, in order, on either path."""
 
-    def __init__(self, replies):
+    def __init__(self, replies, token_logprobs=()):
         self.replies = list(replies)
+        self.token_logprobs = tuple(token_logprobs)
         self.calls = []
+        self.buffered_calls = 0
+
+    def _take(self):
+        return self.replies.pop(0) if self.replies else ""
 
     def chat_stream(self, messages, *, temperature=0.0, max_tokens=256):
         self.calls.append(list(messages))
-        reply = self.replies.pop(0) if self.replies else ""
-        return FakeStream(reply)
+        return FakeStream(self._take(), token_logprobs=self.token_logprobs)
 
-    def chat(self, messages, *, temperature=0.0, max_tokens=256):
-        raise AssertionError("eval runs should not need buffered calls")
+    def chat(self, messages, *, temperature=0.0, max_tokens=256, logprobs=False):
+        self.calls.append(list(messages))
+        self.buffered_calls += 1
+        return LLMResponse(
+            text=self._take(),
+            model="fake-model",
+            prompt_tokens=10,
+            completion_tokens=4,
+            total_tokens=14,
+            latency_seconds=0.05,
+            token_logprobs=self.token_logprobs if logprobs else (),
+        )
 
 
 class BrokenClient:
@@ -127,6 +143,13 @@ class EvalCaseFileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_cases(path)
 
+    def test_rejects_an_invalid_regex(self):
+        path = self.write_cases([
+            {"id": "one", "prompt": "p", "forbid_regex": ["(unclosed"]}
+        ])
+        with self.assertRaises(ValueError):
+            load_cases(path)
+
     def test_rejects_empty_case_list(self):
         path = self.write_cases({"cases": []})
         with self.assertRaises(ValueError):
@@ -162,6 +185,19 @@ class CheckTests(unittest.TestCase):
 
         self.assertEqual(evaluate(case, "use [x**2 for x in range(1, 6)]"), ())
         self.assertTrue(evaluate(case, "use pow(x, 2)"))
+
+    def test_forbidden_patterns_fail_even_on_a_hedged_reply(self):
+        case = EvalCase(
+            id="c", prompt="p", expect_refusal=True,
+            forbid_regex=(r"\$\s*\d",),
+        )
+
+        self.assertEqual(
+            evaluate(case, "That figure is not publicly available."), ()
+        )
+        failures = evaluate(case, "His net worth is about $4.1 billion.")
+        self.assertTrue(any("matches forbidden" in item for item in failures))
+        self.assertTrue(any("expected a refusal" in item for item in failures))
 
     def test_refusal_expectations(self):
         must_refuse = EvalCase(id="c", prompt="p", expect_refusal=True)
@@ -229,8 +265,81 @@ class EvalRunTests(unittest.TestCase):
         summary = run_evals(cases, self.store, BrokenClient(), max_tokens=64)
 
         self.assertEqual(summary.failed, 1)
-        self.assertIn("request failed", summary.results[0].failures[0])
+        self.assertIn("case failed to run", summary.results[0].failures[0])
         self.assertEqual(summary.latency_p50, 0.0)
+
+    def test_a_case_that_cannot_run_does_not_abort_the_run(self):
+        cases = [
+            EvalCase(id="too-big", prompt="word " * 400),
+            EvalCase(id="fine", prompt="hello", expect_contains=("hi",)),
+        ]
+
+        summary = run_evals(
+            cases, self.store, ScriptedClient(["hi"]),
+            context_tokens=200, max_tokens=50,
+        )
+
+        self.assertEqual(len(summary.results), 2)
+        self.assertEqual(summary.results[0].case.id, "too-big")
+        self.assertFalse(summary.results[0].passed)
+        self.assertIn("failed to run", summary.results[0].failures[0])
+        self.assertTrue(summary.results[1].passed)
+
+    def test_an_unexpected_crash_is_contained(self):
+        class BoomThenOk(ScriptedClient):
+            def chat_stream(self, messages, *, temperature=0.0, max_tokens=256):
+                if not self.calls:
+                    self.calls.append(list(messages))
+                    raise RuntimeError("boom")
+                return super().chat_stream(
+                    messages, temperature=temperature, max_tokens=max_tokens
+                )
+
+        cases = [EvalCase(id="boom", prompt="q"), EvalCase(id="ok", prompt="q")]
+
+        summary = run_evals(cases, self.store, BoomThenOk(["fine"]))
+
+        self.assertFalse(summary.results[0].passed)
+        self.assertIn("case crashed: RuntimeError", summary.results[0].failures[0])
+        self.assertTrue(summary.results[1].passed)
+        self.assertEqual(summary.refusal_rate, 0.0)
+
+    def test_gated_cases_are_counted_and_hedge_as_refusal(self):
+        cases = [EvalCase(id="one", prompt="q", expect_contains=("guaranteed",))]
+
+        summary = run_evals(
+            cases,
+            self.store,
+            ScriptedClient(["answer"], token_logprobs=(-2.0,) * 5),
+            confidence_threshold=0.55,
+        )
+
+        self.assertEqual(summary.gated, 1)
+        self.assertEqual(summary.pass_rate, 0.0)
+        self.assertEqual(summary.refusal_rate, 1.0)
+        self.assertAlmostEqual(summary.results[0].confidence, 0.135, places=3)
+
+    def test_comparison_reports_pass_and_refusal_deltas(self):
+        case = EvalCase(id="greet", prompt="q", expect_contains=("hi there",))
+        baseline = run_evals(cases=[case], store=self.store,
+                             client=ScriptedClient(["hi there"]))
+        gated = run_evals(
+            cases=[case], store=self.store,
+            client=ScriptedClient(["hi there"], token_logprobs=(-2.0,) * 5),
+            confidence_threshold=0.55,
+        )
+
+        text = format_comparison(baseline, gated, 0.55)
+
+        self.assertIn("confidence threshold 0.55", text)
+        self.assertIn("pass rate", text)
+        self.assertIn("100% -> 0%", text)
+        self.assertIn("-100 pts", text)
+        self.assertIn("refusal rate", text)
+        self.assertIn("0% -> 100%", text)
+        self.assertIn("+100 pts", text)
+        self.assertIn("gated        0 -> 1", text)
+        self.assertIn("broken       greet", text)
 
     def test_format_summary_reports_pass_fail_and_metrics(self):
         cases = [EvalCase(id="ok", prompt="q", expect_contains=("yes",))]
@@ -285,6 +394,35 @@ class EvalMainTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FAIL  greet", out)
         self.assertIn("missing 'hello'", out)
+
+    def test_compare_gating_runs_twice_and_prints_deltas(self):
+        payload = [
+            {"id": "greet", "prompt": "say hi", "expect_contains": ["hi there"]}
+        ]
+        client = ScriptedClient(
+            ["hi there", "hi there"], token_logprobs=(-2.0,) * 5
+        )
+
+        code, out, _ = self.run_main(
+            payload, client, extra=["--compare-gating"]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("=== baseline (gating off) ===", out)
+        self.assertIn("=== gated (threshold 0.55) ===", out)
+        self.assertIn("gated 1", out)
+        self.assertIn("gating comparison", out)
+
+    def test_invalid_confidence_threshold_exits_two(self):
+        payload = [{"id": "greet", "prompt": "q"}]
+
+        code, _, err = self.run_main(
+            payload, ScriptedClient([]), extra=["--confidence-threshold", "2"]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--confidence-threshold", err)
 
     def test_only_filters_to_one_case(self):
         payload = [

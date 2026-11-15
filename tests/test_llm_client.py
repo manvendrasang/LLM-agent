@@ -93,12 +93,26 @@ class MockHandler(BaseHTTPRequestHandler):
                 }],
                 "usage": {},
             })
-        else:
+        elif MockHandler.mode == "bad_logprobs":
             self.respond(200, {
                 "model": "mock-model",
                 "choices": [{
-                    "message": {"content": "LOCAL_MODEL_OK"}
+                    "message": {"content": "LOCAL_MODEL_OK"},
+                    "logprobs": {"content": [{"token": "x", "logprob": "high"}]},
                 }],
+                "usage": {},
+            })
+        else:
+            choice = {"message": {"content": "LOCAL_MODEL_OK"}}
+            if MockHandler.last_request.get("logprobs"):
+                choice["logprobs"] = {"content": [
+                    {"token": "LOCAL", "logprob": -0.2},
+                    {"token": "_MODEL", "logprob": -0.4},
+                    {"token": "_OK", "logprob": -0.6},
+                ]}
+            self.respond(200, {
+                "model": "mock-model",
+                "choices": [choice],
                 "usage": {
                     "prompt_tokens": 10,
                     "completion_tokens": 4,
@@ -135,6 +149,29 @@ class LLMClientTests(unittest.TestCase):
             base_url=self.base_url,
             timeout_seconds=1.0,
         )
+
+    def test_success_without_logprobs_returns_no_token_logprobs(self):
+        result = self.client.chat([{"role": "user", "content": "test"}])
+
+        self.assertEqual(result.token_logprobs, ())
+        self.assertNotIn("logprobs", MockHandler.last_request)
+
+    def test_logprobs_are_requested_and_parsed(self):
+        result = self.client.chat(
+            [{"role": "user", "content": "test"}], logprobs=True
+        )
+
+        self.assertIs(MockHandler.last_request["logprobs"], True)
+        self.assertEqual(result.token_logprobs, (-0.2, -0.4, -0.6))
+        self.assertEqual(result.text, "LOCAL_MODEL_OK")
+
+    def test_non_numeric_logprobs_raise(self):
+        MockHandler.mode = "bad_logprobs"
+
+        with self.assertRaises(LLMResponseError):
+            self.client.chat(
+                [{"role": "user", "content": "test"}], logprobs=True
+            )
 
     def test_success_discovers_model_and_returns_usage(self):
         result = self.client.chat([

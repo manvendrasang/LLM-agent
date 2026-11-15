@@ -56,10 +56,15 @@ class SSEHandler(BaseHTTPRequestHandler):
             self.send_event("{not json")
             return
 
-        for piece in ("Hello", ", ", "world"):
-            self.send_event(json.dumps({
-                "choices": [{"delta": {"content": piece}}],
-            }))
+        for index, piece in enumerate(("Hello", ", ", "world")):
+            choice = {"delta": {"content": piece}}
+            if SSEHandler.last_request.get("logprobs"):
+                choice["logprobs"] = {
+                    "content": [
+                        {"token": piece, "logprob": (-0.1, -0.2, -0.3)[index]}
+                    ]
+                }
+            self.send_event(json.dumps({"choices": [choice]}))
 
         self.send_event(json.dumps({
             "choices": [],
@@ -115,6 +120,26 @@ class StreamingTests(unittest.TestCase):
             stream.latency_seconds, stream.first_token_seconds
         )
         self.assertTrue(SSEHandler.last_request["stream"])
+
+    def test_stream_collects_token_logprobs_when_requested(self):
+        stream = self.client.chat_stream(
+            [{"role": "user", "content": "hi"}], logprobs=True
+        )
+
+        list(stream)
+
+        self.assertIs(SSEHandler.last_request["logprobs"], True)
+        self.assertEqual(stream.token_logprobs, (-0.1, -0.2, -0.3))
+
+    def test_stream_without_logprobs_stays_empty(self):
+        stream = self.client.chat_stream(
+            [{"role": "user", "content": "hi"}]
+        )
+
+        list(stream)
+
+        self.assertNotIn("logprobs", SSEHandler.last_request)
+        self.assertEqual(stream.token_logprobs, ())
 
     def test_stream_can_only_be_iterated_once(self):
         stream = self.client.chat_stream(

@@ -1,9 +1,13 @@
+import math
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent.chat import (
+    UNSURE_REPLY,
     ChatSession,
+    answer_confidence,
     build_context,
     estimate_tokens,
 )
@@ -14,9 +18,11 @@ SUMMARY_MARKER = "Summarise the earlier part"
 
 
 class FakeStream:
-    def __init__(self, text, first=0.02, latency=0.06, completion=9):
+    def __init__(self, text, first=0.02, latency=0.06, completion=9,
+                 token_logprobs=()):
         self._text = text
         self.text = ""
+        self.token_logprobs = tuple(token_logprobs)
         self.model = "fake-model"
         self.prompt_tokens = 100
         self.completion_tokens = completion
@@ -525,6 +531,114 @@ class ChatSessionTests(unittest.TestCase):
     def test_estimate_tokens_is_monotonic(self):
         self.assertEqual(estimate_tokens(""), 0)
         self.assertLess(estimate_tokens("short"), estimate_tokens("x" * 100))
+
+
+class LogprobClient(FakeClient):
+    """Records logprob requests and returns scripted token logprobs."""
+
+    def __init__(self, reply="ok", token_logprobs=(), **kwargs):
+        super().__init__(reply=reply, **kwargs)
+        self.token_logprobs = tuple(token_logprobs)
+        self.logprob_requests = []
+
+    def chat(self, messages, *, temperature=0.0, max_tokens=256, logprobs=False):
+        self.logprob_requests.append(logprobs)
+        response = super().chat(
+            messages, temperature=temperature, max_tokens=max_tokens
+        )
+        if not logprobs:
+            return response
+        return replace(response, token_logprobs=self.token_logprobs)
+
+
+class ConfidenceTests(unittest.TestCase):
+    def test_confidence_is_the_geometric_mean_of_the_opening(self):
+        self.assertIsNone(answer_confidence([]))
+        self.assertAlmostEqual(answer_confidence([0.0]), 1.0)
+        self.assertAlmostEqual(
+            answer_confidence([-0.1, -0.1, -0.9, -0.9], window=2),
+            math.exp(-0.1),
+            places=9,
+        )
+        # A confident opening is not dragged down by later filler.
+        opening = answer_confidence([-0.01] * 16 + [-8.0] * 40)
+        self.assertGreater(opening, 0.97)
+
+
+class GatingTests(unittest.TestCase):
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.store = SessionStore(Path(temp_dir.name) / "chat.sqlite3")
+
+    def test_low_confidence_answer_becomes_a_hedge(self):
+        client = LogprobClient(
+            reply="It is 4.1 billion dollars.", token_logprobs=(-1.0,) * 8
+        )
+        chat = ChatSession(self.store, client, confidence_threshold=0.55)
+
+        result = chat.send("what is the net worth?")
+
+        self.assertTrue(result.timings.gated)
+        self.assertEqual(result.text, UNSURE_REPLY)
+        self.assertLess(result.timings.confidence, 0.55)
+        self.assertEqual(client.logprob_requests, [True])
+        # The guess is never shown or stored: only question and hedge.
+        self.assertEqual(
+            [message.content for message in chat.history()],
+            ["what is the net worth?", UNSURE_REPLY],
+        )
+        self.assertFalse(result.timings.streamed)
+        self.assertEqual(client.stream_calls, [])
+        self.assertIsNone(result.timings.tokens_per_second)
+        self.assertFalse(result.timings.exact_tokens)
+
+    def test_confident_answer_is_kept(self):
+        client = LogprobClient(reply="ValueError", token_logprobs=(-0.01,) * 5)
+        chat = ChatSession(self.store, client, confidence_threshold=0.55)
+
+        result = chat.send("which exception?")
+
+        self.assertFalse(result.timings.gated)
+        self.assertEqual(result.text, "ValueError")
+        self.assertAlmostEqual(
+            result.timings.confidence, math.exp(-0.01), places=6
+        )
+
+    def test_without_gating_nothing_is_requested_and_streaming_stays_on(self):
+        client = LogprobClient(reply="ok")
+        chat = ChatSession(self.store, client)
+
+        result = chat.send("hi")
+
+        self.assertFalse(result.timings.gated)
+        self.assertIsNone(result.timings.confidence)
+        self.assertEqual(client.logprob_requests, [])
+        self.assertTrue(result.timings.streamed)
+
+    def test_missing_logprobs_cannot_gate(self):
+        client = LogprobClient(reply="ok", token_logprobs=())
+        chat = ChatSession(self.store, client, confidence_threshold=0.55)
+
+        result = chat.send("hi")
+
+        self.assertFalse(result.timings.gated)
+        self.assertIsNone(result.timings.confidence)
+        self.assertEqual(result.text, "ok")
+
+    def test_threshold_must_be_a_probability(self):
+        for bad in (0.0, -0.1, 1.5):
+            with self.assertRaises(ValueError):
+                ChatSession(self.store, FakeClient(), confidence_threshold=bad)
+
+    def test_describe_reports_confidence_and_gating(self):
+        client = LogprobClient(reply="guess", token_logprobs=(-2.0,) * 4)
+        chat = ChatSession(self.store, client, confidence_threshold=0.55)
+
+        described = chat.send("hi").timings.describe()
+
+        self.assertIn("confidence=0.135", described)
+        self.assertIn("gated=True", described)
 
 
 if __name__ == "__main__":

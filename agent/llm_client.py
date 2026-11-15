@@ -43,6 +43,7 @@ class LLMResponse:
     completion_tokens: int | None
     total_tokens: int | None
     latency_seconds: float
+    token_logprobs: tuple[float, ...] = ()
 
 
 def _validate_messages(messages: list[dict[str, str]]) -> None:
@@ -65,6 +66,28 @@ def _validate_generation(temperature: float, max_tokens: int) -> None:
         raise ValueError("max_tokens must be at least 1")
     if not 0.0 <= temperature <= 2.0:
         raise ValueError("temperature must be between 0 and 2")
+
+
+def _parse_logprobs(block: Any) -> tuple[float, ...]:
+    """Token logprobs from an OpenAI-shaped ``logprobs`` block."""
+    if block is None:
+        return ()
+    if not isinstance(block, dict):
+        raise LLMResponseError("logprobs block is not an object")
+
+    entries = block.get("content")
+    if entries is None:
+        return ()
+    if not isinstance(entries, list):
+        raise LLMResponseError("logprobs content is not a list")
+
+    values: list[float] = []
+    for entry in entries:
+        value = entry.get("logprob") if isinstance(entry, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise LLMResponseError("logprobs entry has no numeric logprob")
+        values.append(float(value))
+    return tuple(values)
 
 
 def _token_count(usage: dict[str, Any], key: str) -> int | None:
@@ -164,17 +187,20 @@ class LocalLLMClient:
         *,
         temperature: float = 0.0,
         max_tokens: int = 256,
+        logprobs: bool = False,
     ) -> LLMResponse:
         _validate_messages(messages)
         _validate_generation(temperature, max_tokens)
 
         model = self._resolve_model()
-        payload = {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if logprobs:
+            payload["logprobs"] = True
         request = Request(
             f"{self.base_url}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -197,7 +223,8 @@ class LocalLLMClient:
             ) from exc
 
         try:
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
             usage = data.get("usage", {})
             response_model = data.get("model", model)
 
@@ -215,6 +242,8 @@ class LocalLLMClient:
                 completion_tokens=_token_count(usage, "completion_tokens"),
                 total_tokens=_token_count(usage, "total_tokens"),
                 latency_seconds=latency,
+                # llama-server and the OpenAI API put logprobs on the choice.
+                token_logprobs=_parse_logprobs(choice.get("logprobs")),
             )
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMResponseError(
@@ -282,6 +311,7 @@ class LocalLLMClient:
         *,
         temperature: float = 0.0,
         max_tokens: int = 256,
+        logprobs: bool = False,
     ) -> ChatStream:
         """Start a streaming completion; iterate it to receive text deltas."""
         _validate_messages(messages)
@@ -291,6 +321,7 @@ class LocalLLMClient:
             messages=list(messages),
             temperature=temperature,
             max_tokens=max_tokens,
+            logprobs=logprobs,
         )
 
 
@@ -308,13 +339,16 @@ class ChatStream:
         messages: list[dict[str, str]],
         temperature: float,
         max_tokens: int,
+        logprobs: bool = False,
     ) -> None:
         self._client = client
         self._messages = messages
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._logprobs = logprobs
 
         self.text = ""
+        self.token_logprobs: tuple[float, ...] = ()
         self.model: str | None = None
         self.prompt_tokens: int | None = None
         self.completion_tokens: int | None = None
@@ -346,6 +380,11 @@ class ChatStream:
         choice = choices[0]
         if not isinstance(choice, dict):
             raise LLMResponseError("Streaming chunk has an invalid choice")
+
+        chunk_logprobs = _parse_logprobs(choice.get("logprobs"))
+        if chunk_logprobs:
+            self.token_logprobs += chunk_logprobs
+
         delta = choice.get("delta")
         if not isinstance(delta, dict):
             return None
@@ -364,13 +403,15 @@ class ChatStream:
         client = self._client
         model = client._resolve_model()
         self.model = model
-        payload = {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": self._messages,
             "temperature": self._temperature,
             "max_tokens": self._max_tokens,
             "stream": True,
         }
+        if self._logprobs:
+            payload["logprobs"] = True
         request = Request(
             f"{client.base_url}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

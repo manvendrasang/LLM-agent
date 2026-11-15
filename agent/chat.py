@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -24,6 +25,28 @@ SUMMARY_PROMPT = (
 )
 
 TokenCounter = Callable[[str], int]
+
+# Sent instead of a guess when the model's own token probabilities are low.
+UNSURE_REPLY = (
+    "I'm not confident enough to answer that reliably. Could you rephrase "
+    "the question, add the missing context, or ask something more specific?"
+)
+
+# Only the opening of an answer decides whether it knows: once a model starts
+# confidently, later filler tokens are cheap and inflate any whole-answer mean.
+CONFIDENCE_WINDOW = 16
+
+
+def answer_confidence(
+    token_logprobs: Sequence[float],
+    *,
+    window: int = CONFIDENCE_WINDOW,
+) -> float | None:
+    """Geometric-mean probability of the opening tokens, in 0..1."""
+    values = list(token_logprobs[:window])
+    if not values:
+        return None
+    return math.exp(sum(values) / len(values))
 
 
 def estimate_tokens(text: str) -> int:
@@ -58,6 +81,8 @@ class TurnTimings:
     tokens_per_second: float | None
     streamed: bool
     exact_tokens: bool = False
+    confidence: float | None = None
+    gated: bool = False
 
     def describe(self) -> str:
         speed = (
@@ -71,6 +96,11 @@ class TurnTimings:
             else str(self.completion_tokens)
         )
         prompt_label = "prompt_tokens" if self.exact_tokens else "prompt_tokens~"
+        confidence = (
+            f"{self.confidence:.3f}"
+            if self.confidence is not None
+            else "n/a"
+        )
         return (
             f"prompt_ms={self.prompt_ms:.1f} "
             f"summary_ms={self.summary_ms:.1f} "
@@ -80,7 +110,8 @@ class TurnTimings:
             f"total_ms={self.total_ms:.1f} "
             f"{prompt_label}={self.prompt_tokens} "
             f"completion_tokens={completion} "
-            f"tok_s={speed} stream={self.streamed}"
+            f"tok_s={speed} stream={self.streamed} "
+            f"confidence={confidence} gated={self.gated}"
         )
 
 
@@ -157,9 +188,14 @@ class ChatSession:
         temperature: float = 0.0,
         summarize: bool = True,
         count_tokens: TokenCounter | None = None,
+        confidence_threshold: float | None = None,
     ) -> None:
         if context_tokens < 1:
             raise ValueError("context_tokens must be positive")
+        if confidence_threshold is not None and not (
+            0.0 < confidence_threshold <= 1.0
+        ):
+            raise ValueError("confidence_threshold must be in (0, 1]")
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         if max_tokens >= context_tokens:
@@ -173,6 +209,7 @@ class ChatSession:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.summarize = summarize
+        self.confidence_threshold = confidence_threshold
 
         # Prefer the client's exact tokenizer; the estimate is only a fallback.
         if count_tokens is None:
@@ -411,8 +448,12 @@ class ChatSession:
             self.session_id, "user", text, token_count=pending.token_count
         )
 
+        # Gating reads the logprobs of the whole reply before deciding, so a
+        # low-confidence guess is never shown token by token and then retracted.
+        use_stream = stream and self.confidence_threshold is None
+
         try:
-            if stream:
+            if use_stream:
                 stream_result = self.client.chat_stream(
                     list(context.messages),
                     temperature=self.temperature,
@@ -431,22 +472,45 @@ class ChatSession:
                     - first_token_ms,
                 )
                 completion_tokens = stream_result.completion_tokens
+                token_logprobs = stream_result.token_logprobs
             else:
+                gating = {}
+                if self.confidence_threshold is not None:
+                    gating["logprobs"] = True
                 response = self.client.chat(
                     list(context.messages),
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
+                    **gating,
                 )
                 reply = response.text
                 first_token_ms = response.latency_seconds * 1000.0
                 generation_ms = 0.0
                 completion_tokens = response.completion_tokens
+                token_logprobs = response.token_logprobs
         except BaseException:
             # Roll the turn back so an aborted request (error, timeout or a
             # Ctrl+C during the stream) never leaves an unanswered user
             # message behind. BaseException covers KeyboardInterrupt.
             self.store.delete_message(stored_user.message_id)
             raise
+
+        confidence = answer_confidence(token_logprobs)
+        gated = (
+            self.confidence_threshold is not None
+            and confidence is not None
+            and confidence < self.confidence_threshold
+        )
+        if gated:
+            # The guess is dropped, not stored: the transcript keeps the hedge.
+            logger.info(
+                "gated reply session=%s confidence=%.3f threshold=%.3f",
+                self.session_id,
+                confidence,
+                self.confidence_threshold,
+            )
+            reply = UNSURE_REPLY
+            completion_tokens = self.count_tokens(reply)
 
         # The turn only becomes durable once the model answered: a failed call
         # must not leave a user message with no reply behind it.
@@ -470,7 +534,7 @@ class ChatSession:
         total_ms = (time.perf_counter() - started) * 1000.0
         llm_ms = summary_ms + first_token_ms + generation_ms
         tokens_per_second = None
-        if generation_ms > 0 and completion_tokens:
+        if not gated and generation_ms > 0 and completion_tokens:
             tokens_per_second = completion_tokens / (generation_ms / 1000.0)
 
         timings = TurnTimings(
@@ -483,8 +547,10 @@ class ChatSession:
             prompt_tokens=context.tokens,
             completion_tokens=completion_tokens,
             tokens_per_second=tokens_per_second,
-            streamed=stream,
+            streamed=use_stream,
             exact_tokens=context.exact,
+            confidence=confidence,
+            gated=gated,
         )
         logger.info(
             "turn session=%s messages=%d dropped=%d %s",
@@ -526,6 +592,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--temperature", type=float, default=0.0, help="sampling temperature"
+    )
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=None, metavar="P",
+        help=(
+            "reply with a hedge instead of a guess when the opening tokens' "
+            "geometric-mean probability is below P (buffers replies instead "
+            "of streaming; off by default)"
+        ),
     )
     parser.add_argument("--base-url", default=None, help="inference server URL")
     parser.add_argument("--model", default=None, help="model id to request")
@@ -593,6 +667,7 @@ def main(
             context_tokens=args.context_tokens,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
+            confidence_threshold=args.confidence_threshold,
         )
 
     try:

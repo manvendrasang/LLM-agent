@@ -14,6 +14,7 @@ class FakeStream:
     def __init__(self, text):
         self._text = text
         self.text = ""
+        self.token_logprobs = ()
         self.model = "fake-model"
         self.prompt_tokens = 10
         self.completion_tokens = 4
