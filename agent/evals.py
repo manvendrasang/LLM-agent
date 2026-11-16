@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Sequence
 
 from agent.chat import DEFAULT_SYSTEM_PROMPT, ChatSession
 from agent.llm_client import LLMClientError, LocalLLMClient
+from agent.repo_index import IndexUnavailableError, open_index
 from agent.session_store import SessionStore
 
 DEFAULT_CASES_PATH = "evals/cases.json"
@@ -476,8 +478,6 @@ def main(
 
     retriever = None
     if args.repo_index is not None:
-        from agent.repo_index import IndexUnavailableError, open_index
-
         try:
             retriever = open_index(args.repo_index)
         except IndexUnavailableError as exc:
@@ -487,7 +487,15 @@ def main(
         if reason is not None:
             print(f"warning: {reason}", file=sys.stderr)
 
-    store = SessionStore(args.db)
+    try:
+        store = SessionStore(args.db)
+    except (OSError, sqlite3.Error) as exc:
+        print(
+            f"error: cannot open session database {args.db}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
     settings = dict(
         retriever=retriever,
         system_prompt=args.system,

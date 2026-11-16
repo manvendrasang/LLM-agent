@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
@@ -10,7 +11,9 @@ from typing import Callable, Sequence
 
 from agent.llm_client import LLMClientError, LocalLLMClient
 from agent.repo_index import (
+    DEFAULT_RETRIEVAL_LIMIT,
     IndexUnavailableError,
+    Retriever,
     format_excerpts,
     open_index,
 )
@@ -205,9 +208,9 @@ class ChatSession:
         summarize: bool = True,
         count_tokens: TokenCounter | None = None,
         confidence_threshold: float | None = None,
-        retriever: object | None = None,
+        retriever: Retriever | None = None,
         retrieval_chars: int = 3000,
-        retrieval_limit: int = 3,
+        retrieval_limit: int = DEFAULT_RETRIEVAL_LIMIT,
     ) -> None:
         if context_tokens < 1:
             raise ValueError("context_tokens must be positive")
@@ -266,7 +269,7 @@ class ChatSession:
         if self.retriever is None:
             return "", ()
         try:
-            chunks = self.retriever.search(  # type: ignore[attr-defined]
+            chunks = self.retriever.search(
                 query,
                 max_chars=self.retrieval_chars,
                 limit=self.retrieval_limit,
@@ -281,7 +284,7 @@ class ChatSession:
         if not chunks:
             logger.debug("retrieval: nothing passed the gate for %r", query)
             return "", ()
-        paths = tuple(getattr(chunk, "path", "?") for chunk in chunks)
+        paths = tuple(chunk.path for chunk in chunks)
         logger.info("retrieval: %d chunks from %s", len(chunks), ", ".join(paths))
         return format_excerpts(chunks), paths
 
@@ -328,7 +331,12 @@ class ChatSession:
                 fits = True
             if fits:
                 break
-            transcript = transcript[len(transcript) // 4:]
+            # Cut on a line boundary: half a line of code summarises worse
+            # than a complete one, and the oldest material is already covered
+            # by the previous summary.
+            cut = transcript[len(transcript) // 4:]
+            newline = cut.find("\n")
+            transcript = cut[newline + 1:] if newline != -1 else cut
 
         started = time.perf_counter()
         try:
@@ -650,8 +658,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="character budget for retrieved excerpts (default: 3000)",
     )
     parser.add_argument(
-        "--retrieval-limit", type=int, default=3,
-        help="maximum retrieval excerpts per turn (default: 3)",
+        "--retrieval-limit", type=int, default=DEFAULT_RETRIEVAL_LIMIT,
+        help=(
+            "maximum retrieval excerpts per turn "
+            f"(default: {DEFAULT_RETRIEVAL_LIMIT})"
+        ),
     )
     parser.add_argument(
         "--repo-index", default=None, metavar="DB",
@@ -713,7 +724,17 @@ def main(
 ) -> int:
     args = _parse_args(argv)
 
-    store = SessionStore(args.db)
+    try:
+        store = SessionStore(args.db)
+    except (OSError, sqlite3.Error) as exc:
+        # A path that cannot hold a database is a startup error, like a bad
+        # index: report it instead of printing a traceback.
+        print(
+            f"error: cannot open session database {args.db}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.list_sessions:
         _print_sessions(store)
         return 0

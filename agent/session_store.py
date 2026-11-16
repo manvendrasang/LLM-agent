@@ -130,7 +130,10 @@ class SessionStore:
             )
 
         session = self.get_session(session_id)
-        assert session is not None
+        if session is None:
+            # Cannot happen after the INSERT above; fail loudly rather than
+            # return None (an assert would vanish under python -O).
+            raise RuntimeError(f"session {session_id} vanished after insert")
         return session
 
     def get_session(self, session_id: str) -> Session | None:
@@ -269,7 +272,8 @@ class SessionStore:
                 raise KeyError(f"Session not found: {session_id}")
 
         session = self.get_session(session_id)
-        assert session is not None
+        if session is None:
+            raise RuntimeError(f"session {session_id} vanished after update")
         return session
 
     def delete_message(self, message_id: int) -> None:

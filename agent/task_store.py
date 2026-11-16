@@ -36,6 +36,8 @@ class TaskStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        # Single connection factory: tests subclass the store to assert every
+        # handle is closed, so this stays a method even though it is a one-liner.
         return open_connection(self.db_path)
 
     @contextmanager
@@ -100,7 +102,8 @@ class TaskStore:
             )
 
         task = self.get_task(task_id)
-        assert task is not None
+        if task is None:
+            raise RuntimeError(f"task {task_id} vanished after insert")
         return task
 
     def get_task(self, task_id: str) -> TaskRecord | None:
@@ -158,7 +161,8 @@ class TaskStore:
                 raise KeyError(f"Task not found: {task_id}")
 
         task = self.get_task(task_id)
-        assert task is not None
+        if task is None:
+            raise RuntimeError(f"task {task_id} vanished after update")
         return task
 
     def save_checkpoint(
@@ -183,5 +187,6 @@ class TaskStore:
                 raise KeyError(f"Task not found: {task_id}")
 
         task = self.get_task(task_id)
-        assert task is not None
+        if task is None:
+            raise RuntimeError(f"task {task_id} vanished after checkpoint")
         return task

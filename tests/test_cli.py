@@ -10,6 +10,22 @@ from agent.llm_client import LLMResponse
 from agent.session_store import SessionStore
 
 
+class DatabasePathTests(unittest.TestCase):
+    def test_an_unopenable_database_path_exits_two(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        blocker = Path(temp_dir.name) / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["--list", "--db", str(blocker / "chat.sqlite3")])
+
+        self.assertEqual(code, 2)
+        self.assertIn("cannot open session database", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+
 class FakeStream:
     def __init__(self, text):
         self._text = text

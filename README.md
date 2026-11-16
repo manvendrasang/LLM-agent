@@ -419,61 +419,141 @@ The four pieces, in dependency order:
    system block above the conversation, counted against the same token budget
    and not persisted. Retrieval time is inside `prompt_ms`, and the timing line
    reports `retrieved=N`. Excerpts are **fenced and labelled as untrusted data**,
-   and instruction-like text inside them ("ignore … instructions", "system
-   override", "reply with …", `MARKER-99` tokens) is replaced with
+   and instruction-like text inside them is replaced with
    `[removed: instruction-like text]` before the model can read it — a framing
-   sentence alone does not stop a 3B.
+   sentence alone does not stop a 3B. The rules are deliberately narrow so real
+   content survives: "ignore … instructions"/"disregard the rules", "system
+   override", "reply with the token/word/…", and marker tokens only on lines that
+   also talk about instructing or replying and never for known prefixes. `HTTP-200`,
+   `UTF-8`, `SHA-256`, `CVE-2024-1234`, "reply with a 404" and "reply with the
+   error message" all pass through unchanged (tests cover each). File text also
+   cannot close its own fence: `<<<`/`>>>` are neutralised first.
 4. **Repo-grounded cases** — eleven, answerable only from this repo: `--db`,
    `is_refusal`, `summarised_until`, `CONFIDENCE_WINDOW`, `_budget`,
    `SUMMARY_PROMPT`, `delete_message`, `append_message`, `estimate_tokens`,
    `TurnTimings.describe`, plus a poisoned-file case that must *not* emit the
    marker (`tests/fixtures/poisoned_note.md`).
 
-Missing or unreadable indexes fail at startup, not mid-turn: `--repo-index`
-is opened read-only and checked for a populated `chunks` table, so a typo exits
-with `error: index not found: …; rebuild it with: python -m agent.repo_index
-build --db …` and exit code 2 (same for a corrupt file or a database without the
-table). If an index breaks *during* a session, that turn is answered without
+Missing, unreadable or outdated indexes fail at startup, not mid-turn:
+`--repo-index` is opened read-only and checked for a populated `chunks` table
+*with the expected columns* (`path`, `start_line`, `end_line`, `kind`, `text`),
+so a typo exits with `error: index not found: …; rebuild it with: python -m
+agent.repo_index build --db …` and exit code 2 — as does a corrupt file, a
+database without the table, or an index built by an older version
+(`… was built by an older version (missing columns: kind); rebuild …`). If an index breaks *during* a session, that turn is answered without
 excerpts and a warning is logged: retrieval is optional context, so it should
 cost the excerpts, never the turn. A missing path is never silently created as an
 empty SQLite file. `build` records the git commit, and both CLIs print
 `warning: index was built at <sha>, repository is at <sha>; rebuild …` when the
 working tree has moved on, so a stale index does not answer silently.
 
-Measured on the bundled 3B (`--max-tokens 120`, temperature 0):
+### Measurement index (the numbers below are frozen against it)
 
-| index | repo cases | whole suite | p50 |
+Most of the earlier drift came from the eval corpus containing the answers:
+`tests/` and `README.md` name every identifier the repo-grounded cases ask for,
+and every test edit changed the ranking. The measurement index is built once and
+only changes when `agent/` does — `make` wraps both steps:
+
+```bash
+make index-measure              # rebuild state/index-measure.sqlite3
+make measure                    # the above, then the eval suite against it
+```
+
+equivalent to:
+
+```bash
+python -m agent.repo_index build --db state/index-measure.sqlite3 --root . \
+    --exclude 'tests/*' --exclude 'README.md'
+python -m agent.evals --repo-index state/index-measure.sqlite3
+```
+
+Measured on the bundled 3B (`--max-tokens 120`, temperature 0), 21 cases:
+
+| index | repo cases (10 code) | whole suite | p50 |
 | --- | --- | --- | --- |
-| none (baseline to beat) | **1/11** | 11/21 | 419 ms |
-| full corpus, symbol chunks | **9/11** | 18/21 | 542 ms |
+| none (baseline to beat) | **1/10** | 11/21 | 291 ms |
+| frozen measurement index | **4/10** | 14/21 | 581 ms |
+| frozen + identifier lookup | **5/10** | 14–15/21 | 411 ms |
+| frozen + identifier + docstring keys | **6/10** | 16/21 | 374–507 ms |
+| full working tree (leaky) | 11/11 | 20/21 | 593 ms |
 
-The two remaining misses are both lexical gaps, not ranking bugs:
-`repo-budget-helper` asks what may be "spent on one request" while the method is
-`_budget` (the model answers `send`), and `repo-timings-describe` asks which
-method "renders the timing line", where the code says `describe()`; the model
-answers `render_timing_line`. Neither name appears in the question, so no keyword
-match can bridge it — that is the ceiling of a lexical retriever, and the reason
-the next step is embeddings or query rewriting, not threshold tuning.
+The full-tree number is an upper bound, not a capability claim: that corpus
+contains the answers, so it flatters retrieval by several cases. On the frozen
+index the honest gain is **1/10 → 6/10** (`--db`, `summarised_until`,
+`SUMMARY_PROMPT`, `estimate_tokens`, `describe`, `delete_message`), with four
+misses: `is_refusal` (answers `expect_refusal`), `CONFIDENCE_WINDOW` (answers
+`confidence_threshold`), `_budget` (`__init__`) and `append_message`
+(`_insert_session`). Every remaining miss is a lexical gap: the question names
+the concept in prose (`refusal`, `budget`, `writes`) and never writes the
+identifier.
 
-Symbol chunks were the change that mattered: the same corpus scored 11/21 with
-line windows only, and 18/21 with per-`def` chunks and the `1.9x` boost. A
-code-only index (`--exclude 'README.md' --exclude 'tests/*'`) is now *worse*
-(4/10 of the same repo cases) because tests both exercise the answers and get
-scored as symbols themselves — so the full working tree is the right default.
+### Symbol lookup (name → file:line)
 
-Two caveats worth keeping in view:
+`build` also fills a `symbols` table from `ast`: one row per function, class,
+module/class constant and plain attribute assignment (`self._budget = …`).
+`search` sends **identifier-shaped query words** — snake_case, ALLCAPS or
+camelCase — to that table first and ranks exact matches (score `1000`) above
+prefix matches (`500`), both above every bm25 hit and outside the coverage gate.
+Lookup hits still obey `--retrieval-chars` and the chunk limit.
 
-- **Some of the gain is leakage.** The README and tests describe the eval cases,
-  so a retrieved chunk can hand the model the answer. Symbol ranking reduced the
-  effect (code definitions now outrank prose about them) but did not remove it;
-  treat 18/21 as an upper bound and 9/11 on repo cases as the honest number.
-- **Retrieval does not stop a determined injection.** Before redaction the
-  poisoned-file case failed (the model printed `POISON-99`); the same model still
-  obeys a user-supplied "ignore your instructions" (`BANANA-42`). Redaction makes
-  the *file* vector fail, not the user vector.
+The identifier gate is the whole point. Prefix-matching ordinary English was
+tried first and rejected: `session` prefixes a dozen names, so all ten repo
+questions got three off-topic definitions on top (`llm_client.py:41` for the
+refusal question, `chat.py:768` for `--db`). That variant was inspected and
+dropped, not scored — it would have measured the ranking hazard, not a gain.
 
-So: a retriever has to beat **1/11** repo cases to pay for its ~120 ms and three
-chunks per turn; the current one reaches 9/11.
+On the frozen suite the lookup fires only for `TurnTimings` and buys exactly one
+case (`describe`, which the class chunk contains). That is the honest delta of
+this feature here: **4/10 → 5/10**, suite totals unchanged within run-to-run
+noise. It earns its place when a user pastes an identifier (`where is
+summarised_until set?`), which the fixture suite does not do.
+
+### Docstring and comment keys
+
+`symbols.doc` holds each definition's docstring plus the contiguous `#` block
+above it, and prose questions are matched against it: two matched words, at
+least one of them rare across all symbol docs, scored by summed `1/df` so a
+docstring that merely mentions "message" and "turn" loses to one whose words
+are specific to the question. `"removes"` matches `remove`/`removed` through a
+five-character stem.
+
+This is a *fallback*, not a ranking change. A doc hit is appended only when the
+bm25 chunks left room inside `--retrieval-limit`, because promoting it was
+measured as harmful: with doc hits in front, `repo-db-flag` was answered from
+`repo_index.py`. Rarity weighting alone does not fix that — the docstrings of
+this project's own tooling mention `CONFIDENCE_WINDOW` and `confidence`, so they
+compete with the constant's own comment.
+
+The measured effect is **+1 repo case, 5/10 → 6/10, 16/21**, stable across two
+runs. Be precise about the cause: the flipped case (`repo-abort-helper`) did
+*not* include its doc hit, which loses to three full bm25 slots; the pass came
+from the rebuilt index's statistics. In the ten repo questions a doc hit is
+included for 2–3 of them, and it is the right definition in fewer. So the
+mechanism is tested and available (a unit fixture shows `"which method removes a
+message when a turn is aborted"` → `delete_message`), but it is not yet what
+earns the case. Making it earn one needs a replace-the-weakest-excerpt policy
+plus an eval set that is not these ten questions.
+
+The poisoned-file case is excluded from the frozen index on purpose (its fixture
+lives in `tests/`), which is why the table counts ten code cases: with no
+excerpt to read it passes trivially, so it only measures anything on a full-tree
+index. It is also the one flaky case: two back-to-back runs at temperature 0
+scored 14/21 and 15/21, because with no excerpt the 3B sometimes names the
+marker anyway. Suite totals from this index are good to ±1; the ten code cases
+were stable across runs.
+
+Two ranking ideas were tried and reverted because they cost cases
+(18/21 → 16/21 on the leaky corpus): word-boundary coverage instead of substring
+coverage, and down-weighting `tests/` paths.
+
+A user-supplied "ignore your instructions" still gets `BANANA-42` out of the
+model; redaction closes the *file* vector, not the user vector.
+
+So: a retriever has to beat **1/10** on the frozen index to pay for its ~190 ms
+and three chunks per turn. Docstring keys moved it to 6/10; the next honest step
+is not more threshold tuning on ten questions but a larger, split eval set
+(identifier asks vs prose asks), then embeddings if prose still plateaus. Rebuild
+the baseline with `make index-measure` before believing any of these numbers.
 
 ## Run the tests
 
@@ -481,7 +561,7 @@ chunks per turn; the current one reaches 9/11.
 python3 -m unittest discover -s tests -v
 ```
 
-160 tests, no network or model required — the client and streaming tests start a
+182 tests, no network or model required — the client and streaming tests start a
 local mock HTTP server on an ephemeral port, and the runner/chat/CLI tests use a
 fake client. To run a single module:
 

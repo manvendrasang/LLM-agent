@@ -19,7 +19,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Protocol, Sequence
+from urllib.parse import quote
 
 # Plain .txt is left out on purpose: this repo has 200 KB prose dumps that
 # match everything and drown the ranking.
@@ -44,22 +45,58 @@ DEFAULT_MIN_SCORE = 0.0
 # control we tried without dropping a right answer.
 DEFAULT_MIN_COVERAGE = 2
 DEFAULT_MAX_CHARS = 4000
+# One default for the library, both CLIs and ChatSession: three excerpts is
+# what fits a 3K-character budget without crowding out the conversation.
+DEFAULT_RETRIEVAL_LIMIT = 3
 MAX_TERMS = 12
 # Symbol chunks (a def/class and its body) are what code questions usually want,
 # so they outrank prose that merely talks about the same words.
 SYMBOL_BOOST = 1.9
+
 MAX_SYMBOL_LINES = 24
+
+# A question that names an identifier exactly ("where is summarised_until") is
+# answering itself out of the symbol table; rank those above every bm25 hit.
+SYMBOL_EXACT_SCORE = 1000.0
+SYMBOL_PREFIX_SCORE = 500.0
+# Code words in a docstring or the comment above a definition: "which method
+# removes a message" should reach ``delete_message``. Ranked below a real
+# identifier match, above bm25.
+SYMBOL_PROSE_SCORE = 200.0
+# One shared word is a coincidence; two is what the doc-matching gate needs.
+PROSE_MIN_OVERLAP = 2
+# Shorter prefixes match half the module and would bury the FTS results.
+MIN_LOOKUP_TERM = 4
 
 # Retrieved text is attacker-controlled once the index covers a real repository.
 # The header below is a request, not a guarantee: a 3B will still follow a
 # directive it can read, so instruction-like text is removed before it is shown.
+#
+# These patterns deliberately stay narrow. Documentation legitimately contains
+# "reply with a 404", "HTTP-200" and "UTF-8"; redacting those would corrupt the
+# excerpts the retriever exists to provide.
 INJECTION_PATTERNS = (
-    re.compile(r"(?i)\b(ignore|disregard|forget)\b[^\n.]{0,60}"
-               r"\b(instructions?|rules|prompts?)\b"),
+    # "ignore all of your previous instructions", "disregard the rules above"
+    re.compile(
+        r"(?i)\b(ignore|disregard|forget)\b[^\n.]{0,60}"
+        r"\b(instructions?|rules|prompts?)\b"
+    ),
     re.compile(r"(?i)\bsystem (override|prompt)\b"),
-    re.compile(r"(?i)\breply\s+with\b[^\n.]{0,60}"),
-    # Marker tokens are the classic proof-of-injection (BANANA-42, POISON-99).
-    re.compile(r"\b[A-Z]{2,}-\d+\b"),
+    # Only when the demanded payload is explicitly a token/marker/phrase, so
+    # "reply with a 404" and "reply with the error message" survive.
+    re.compile(
+        r"(?i)\breply\s+(?:with|only\s+with)\s+(?:exactly\s+)?(?:the\s+)?"
+        r"(?:token|word|string|marker|phrase|text)\b[^\n.]{0,40}"
+    ),
+)
+# Marker tokens (POISON-99) are only stripped on lines that also talk about
+# instructing or replying, and never when they are a known technical identifier.
+MARKER_TOKEN = re.compile(
+    r"\b(?!(?:HTTP|HTTPS|UTF|ISO|SHA|MD|AES|RSA|TLS|SSL|RFC|CVE|IPV|ERR|ID|PT|MB|KB|GB)-)"
+    r"[A-Z]{2,}-\d+\b"
+)
+MARKER_CONTEXT = re.compile(
+    r"(?i)\b(ignore|override|instructions?|token|reply|say|output|print|repeat|emit)\b"
 )
 REDACTION = "[removed: instruction-like text]"
 
@@ -89,6 +126,20 @@ class IndexUnavailableError(RuntimeError):
     """The index is missing, unreadable or not an index at all."""
 
 
+# Columns every chunk row must have; an index built before one of them existed
+# must be rejected at startup, not once per turn.
+REQUIRED_COLUMNS = frozenset(
+    {"path", "start_line", "end_line", "kind", "text"}
+)
+# Tables every index needs; ``symbols`` is the name -> file:line lookup.
+REQUIRED_TABLES = frozenset({"chunks", "symbols"})
+# Columns ``symbols`` must have. ``doc`` holds the docstring and the comment
+# block above a definition; without it the prose lookup cannot work.
+REQUIRED_SYMBOL_COLUMNS = frozenset(
+    {"name", "name_lower", "path", "start_line", "end_line", "kind", "text", "doc"}
+)
+
+
 @dataclass(frozen=True)
 class Chunk:
     path: str
@@ -101,6 +152,18 @@ class Chunk:
     @property
     def location(self) -> str:
         return f"{self.path}:{self.start_line}-{self.end_line}"
+
+
+class Retriever(Protocol):
+    """What ChatSession needs from a retriever; RepoIndex is one."""
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = DEFAULT_RETRIEVAL_LIMIT,
+        max_chars: int = DEFAULT_MAX_CHARS,
+    ) -> Sequence[Chunk]: ...
 
 
 def query_terms(query: str) -> list[str]:
@@ -120,6 +183,63 @@ def query_terms(query: str) -> list[str]:
     return terms
 
 
+def idf_weight(total: int, found: int) -> float:
+    """Rarity weight for one query term; zero matches counts as one.
+
+    FTS counts whole tokens while the coverage gate matches substrings, so a
+    query word that is only part of a token ("refus" inside ``refusal``)
+    reports 0 matches even though a chunk visibly contains it. Underscores are
+    separators to FTS5, so identifiers such as ``is_refusal`` are not affected.
+    Treat 0 as "found once" instead of handing out the maximum weight reserved
+    for a term that appears nowhere.
+    """
+    return math.log((total + 1) / (max(found, 1) + 1)) + 1.0
+
+
+def term_matches(term: str, words: set[str]) -> bool:
+    """Prefix-tolerant word match, so "removes" finds "remove"/"removed".
+
+    Docstrings are prose, not query terms: exact matching alone misses every
+    inflected form the question is likely to use.
+    """
+    if term in words:
+        return True
+    stem = term[: max(5, len(term) - 1)]
+    return any(word.startswith(stem) for word in words)
+
+
+def identifier_terms(query: str) -> list[str]:
+    """Query words shaped like identifiers: snake_case, ALLCAPS or camelCase.
+
+    Prefix matching on ordinary English backfires: "session" prefixes a dozen
+    names and buries the chunk that answers the question, so only words that
+    were written as code are sent to the symbol table.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in TOKEN_RE.findall(query):
+        if len(raw) < MIN_LOOKUP_TERM:
+            continue
+        shaped = (
+            "_" in raw
+            or raw.isupper()
+            or any(char.isupper() for char in raw[1:])
+        )
+        if not shaped:
+            continue
+        lowered = raw.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(lowered)
+    return terms
+
+
+def sanitise_fences(text: str) -> str:
+    """Stop a file from closing its own excerpt fence."""
+    return text.replace("<<<", "\u2039\u2039\u2039").replace(">>>", "\u203a\u203a\u203a")
+
+
 def format_excerpts(
     chunks: Sequence[Chunk],
     *,
@@ -135,16 +255,22 @@ def format_excerpts(
     lines = [header]
     for chunk in chunks:
         lines.append(f"<<<EXCERPT {chunk.location}>>>")
-        lines.append(redact_instructions(chunk.text.rstrip()))
+        lines.append(redact_instructions(sanitise_fences(chunk.text.rstrip())))
         lines.append("<<<END EXCERPT>>>")
     return "\n".join(lines)
 
 
 def redact_instructions(text: str) -> str:
-    """Strip instruction-like text out of retrieved content."""
+    """Strip instruction-like text out of retrieved content, conservatively."""
     for pattern in INJECTION_PATTERNS:
         text = pattern.sub(REDACTION, text)
-    return text
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        if MARKER_CONTEXT.search(line) and MARKER_TOKEN.search(line):
+            line = MARKER_TOKEN.sub(REDACTION, line)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 class RepoIndex:
@@ -203,7 +329,26 @@ class RepoIndex:
                 files.append(path)
         return files
 
-    def _iter_chunks(self) -> Iterator[tuple[str, int, int, str, str]]:
+    @staticmethod
+    def _parse_python(text: str) -> ast.Module | None:
+        try:
+            return ast.parse(text)
+        except SyntaxError:
+            return None
+
+    def _iter_rows(
+        self,
+    ) -> Iterator[
+        tuple[
+            list[tuple[str, int, int, str, str]],
+            list[tuple[str, str, int, int, str, str, str]],
+        ]
+    ]:
+        """Chunk and symbol rows per file, parsed once.
+
+        One pass matters twice: ``git ls-files`` runs once instead of twice,
+        and a module is parsed once instead of once per row kind.
+        """
         root = self.root.resolve()
         for path in self._tracked_files():
             if path.suffix.lower() not in TEXT_SUFFIXES:
@@ -218,9 +363,15 @@ class RepoIndex:
                 relative = path.resolve().relative_to(root).as_posix()
             except ValueError:
                 relative = path.as_posix()
-            yield from self._window_chunks(relative, text)
+
+            chunks = list(self._window_chunks(relative, text))
+            symbols: list[tuple[str, str, int, int, str, str, str]] = []
             if path.suffix == ".py":
-                yield from self._symbol_chunks(relative, text)
+                tree = self._parse_python(text)
+                if tree is not None:
+                    chunks.extend(self._symbol_chunks(relative, text, tree))
+                    symbols = list(self._symbol_defs(relative, text, tree))
+            yield chunks, symbols
 
     def _window_chunks(
         self, relative: str, text: str
@@ -241,12 +392,11 @@ class RepoIndex:
             )
 
     def _symbol_chunks(
-        self, relative: str, text: str
+        self, relative: str, text: str, tree: ast.AST | None = None
     ) -> Iterator[tuple[str, int, int, str, str]]:
         """One chunk per function/class, so the definition is a unit."""
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
+        tree = tree if tree is not None else self._parse_python(text)
+        if tree is None:
             return
         lines = text.splitlines()
         for node in ast.walk(tree):
@@ -263,6 +413,82 @@ class RepoIndex:
             if not snippet:
                 continue
             yield (relative, start, end, "symbol", snippet[:MAX_CHUNK_CHARS])
+
+    def _symbol_defs(
+        self, relative: str, text: str, tree: ast.AST | None = None
+    ) -> Iterator[tuple[str, str, int, int, str, str, str]]:
+        """``(name, path, start, end, kind, snippet, doc)`` for a module's defs.
+
+        Functions and classes are what code questions ask about; module- and
+        class-level assignments (``CONFIDENCE_WINDOW = 16``) and plain attribute
+        assignments (``self._budget = …``) cover the constants and helpers that
+        are not ``def``s. ``doc`` is the docstring plus the contiguous comment
+        block above the definition, which is the only bridge between a prose
+        question and an identifier.
+        """
+        tree = tree if tree is not None else self._parse_python(text)
+        if tree is None:
+            return
+        lines = text.splitlines()
+
+        def snippet(node: ast.AST) -> tuple[int, int, str]:
+            start = getattr(node, "lineno", 1) or 1
+            end = min(
+                getattr(node, "end_lineno", start) or start,
+                start + MAX_SYMBOL_LINES - 1,
+            )
+            return start, end, "\n".join(lines[start - 1:end]).strip()
+
+        def doc_for(node: ast.AST) -> str:
+            parts: list[str] = []
+            decorators = getattr(node, "decorator_list", None) or []
+            anchor = decorators[0].lineno if decorators else (
+                getattr(node, "lineno", 1) or 1
+            )
+            comments: list[str] = []
+            index = anchor - 2  # zero-based line above the decorator or def
+            while index >= 0:
+                line = lines[index].strip()
+                if not line.startswith("#"):
+                    break
+                comments.append(line.lstrip("#").strip())
+                index -= 1
+            if comments:
+                parts.append(" ".join(reversed(comments)))
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                docstring = ast.get_docstring(node, clean=True)
+                if docstring:
+                    parts.append(docstring)
+            return "\n".join(parts)
+
+        for node in ast.walk(tree):
+            names: list[tuple[str, str]] = []
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.append((node.name, "function"))
+            elif isinstance(node, ast.ClassDef):
+                names.append((node.name, "class"))
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.append((target.id, "constant"))
+                    elif isinstance(target, ast.Attribute):
+                        names.append((target.attr, "attribute"))
+            elif isinstance(node, ast.AnnAssign):
+                target = node.target
+                if isinstance(target, ast.Name):
+                    names.append((target.id, "constant"))
+                elif isinstance(target, ast.Attribute):
+                    names.append((target.attr, "attribute"))
+            if not names:
+                continue
+            start, end, body = snippet(node)
+            if not body:
+                continue
+            doc = doc_for(node)
+            for name, kind in names:
+                yield (name, relative, start, end, kind, body, doc)
 
     def _excluded(self, path: Path) -> bool:
         try:
@@ -282,13 +508,37 @@ class RepoIndex:
                 "path UNINDEXED, start_line UNINDEXED, end_line UNINDEXED, "
                 "kind UNINDEXED, text)"
             )
+            connection.execute("DROP TABLE IF EXISTS symbols")
+            connection.execute(
+                "CREATE TABLE symbols ("
+                "name TEXT NOT NULL, name_lower TEXT NOT NULL, path TEXT NOT NULL, "
+                "start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, "
+                "kind TEXT NOT NULL, text TEXT NOT NULL, "
+                "doc TEXT NOT NULL DEFAULT '')"
+            )
+            connection.execute(
+                "CREATE INDEX symbols_name_lower ON symbols (name_lower)"
+            )
             connection.execute("DROP TABLE IF EXISTS index_meta")
             connection.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
-            rows = list(self._iter_chunks())
+            rows: list[tuple[str, int, int, str, str]] = []
+            symbols: list[tuple[str, str, str, int, int, str, str]] = []
+            for file_chunks, file_symbols in self._iter_rows():
+                rows.extend(file_chunks)
+                symbols.extend(
+                    (name, name.lower(), path, start, end, kind, text, doc)
+                    for name, path, start, end, kind, text, doc in file_symbols
+                )
             connection.executemany(
                 "INSERT INTO chunks (path, start_line, end_line, kind, text) "
                 "VALUES (?, ?, ?, ?, ?)",
                 rows,
+            )
+            connection.executemany(
+                "INSERT INTO symbols "
+                "(name, name_lower, path, start_line, end_line, kind, text, doc) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                symbols,
             )
             connection.executemany(
                 "INSERT INTO index_meta (key, value) VALUES (?, ?)",
@@ -296,6 +546,7 @@ class RepoIndex:
                     ("commit", self._git_head() or ""),
                     ("root", str(self.root.resolve())),
                     ("chunks", str(len(rows))),
+                    ("symbols", str(len(symbols))),
                 ],
             )
             connection.commit()
@@ -351,8 +602,10 @@ class RepoIndex:
                 f"index not found: {self.db_path}; {self._rebuild_hint()}"
             )
         try:
+            # quote() keeps '?', '#' and '%' in a path from being read as URI
+            # syntax, which would open the wrong file or fail outright.
             return sqlite3.connect(
-                f"file:{self.db_path}?mode=ro", uri=True
+                f"file:{quote(self.db_path.as_posix())}?mode=ro", uri=True
             )
         except sqlite3.Error as exc:
             raise IndexUnavailableError(
@@ -366,6 +619,20 @@ class RepoIndex:
             count = connection.execute(
                 "SELECT count(*) FROM chunks"
             ).fetchone()[0]
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(chunks)")
+            }
+            symbol_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(symbols)")
+            }
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
         except sqlite3.Error as exc:
             raise IndexUnavailableError(
                 f"{self.db_path} is not a usable index ({exc}); "
@@ -373,17 +640,160 @@ class RepoIndex:
             ) from exc
         finally:
             connection.close()
+
+        missing = sorted(REQUIRED_COLUMNS - columns)
+        if missing:
+            raise IndexUnavailableError(
+                f"index {self.db_path} was built by an older version "
+                f"(missing columns: {', '.join(missing)}); "
+                f"{self._rebuild_hint()}"
+            )
         if not count:
             raise IndexUnavailableError(
                 f"index {self.db_path} is empty; {self._rebuild_hint()}"
             )
+        missing_tables = sorted(REQUIRED_TABLES - tables)
+        if missing_tables:
+            raise IndexUnavailableError(
+                f"index {self.db_path} was built by an older version "
+                f"(missing tables: {', '.join(missing_tables)}); "
+                f"{self._rebuild_hint()}"
+            )
+        missing_symbol_columns = sorted(REQUIRED_SYMBOL_COLUMNS - symbol_columns)
+        if missing_symbol_columns:
+            raise IndexUnavailableError(
+                f"index {self.db_path} was built by an older version "
+                f"(missing symbols columns: {', '.join(missing_symbol_columns)}); "
+                f"{self._rebuild_hint()}"
+            )
 
     # -- searching ------------------------------------------------------
+    def _term_weights(
+        self, connection: sqlite3.Connection, terms: Sequence[str]
+    ) -> dict[str, float]:
+        """Rare terms carry the signal; "code" and "file" are everywhere and
+        would otherwise outvote the one identifier that matters.
+        """
+        total = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        weights: dict[str, float] = {}
+        for term in terms:
+            found = connection.execute(
+                "SELECT COUNT(*) FROM chunks WHERE chunks MATCH ?",
+                (f'"{term}"',),
+            ).fetchone()[0]
+            weights[term] = idf_weight(total, found)
+        return weights
+
+    def _symbol_lookup(
+        self,
+        connection: sqlite3.Connection,
+        query: str,
+        limit: int,
+    ) -> tuple[list[Chunk], Chunk | None]:
+        """Identifier hits (exact, then prefix) and at most one prose hit.
+
+        Leading underscores are ignored for matching so that ``_budget`` is
+        reachable from "budget", but the stored name keeps them.
+        """
+        terms = identifier_terms(query)
+        hits: list[Chunk] = []
+        seen: set[tuple[str, int]] = set()
+
+        def take(score: float, row: tuple[str, int, int, str, str]) -> None:
+            path, start, end, kind, text = row
+            key = (path, start)
+            if key in seen or not text.strip():
+                return
+            seen.add(key)
+            hits.append(Chunk(path, start, end, text, score, "symbol"))
+
+        columns = "path, start_line, end_line, kind, text FROM symbols "
+        for term in terms:
+            if len(term) < MIN_LOOKUP_TERM:
+                continue
+            for key in (term, f"_{term}"):
+                for row in connection.execute(
+                    f"SELECT {columns} WHERE name_lower = ? "
+                    "ORDER BY length(name), path LIMIT ?",
+                    (key, limit),
+                ).fetchall():
+                    take(SYMBOL_EXACT_SCORE, row)
+        for term in terms:
+            if len(term) < MIN_LOOKUP_TERM:
+                continue
+            for key in (term, f"_{term}"):
+                for row in connection.execute(
+                    f"SELECT {columns} WHERE name_lower > ? AND name_lower < ? "
+                    "ORDER BY length(name), path LIMIT ?",
+                    (key, key + "\uffff", limit),
+                ).fetchall():
+                    take(SYMBOL_PREFIX_SCORE, row)
+
+        return hits, self._prose_hit(connection, query)
+
+    def _prose_hit(
+        self, connection: sqlite3.Connection, query: str
+    ) -> Chunk | None:
+        """The best docstring/comment match, or None.
+
+        Docstrings are the only text that relates "removes a message" to
+        ``delete_message``, but shared English words are cheap, so a hit needs
+        two matches and one of them has to be distinctive across the symbol
+        docs. One hit only: a page of shared words must not crowd the excerpts.
+        """
+        prose_terms = [
+            term for term in query_terms(query)
+            if len(term) >= MIN_LOOKUP_TERM and "_" not in term
+        ]
+        if not prose_terms:
+            return None
+
+        docs = [
+            row
+            for row in connection.execute(
+                "SELECT path, start_line, end_line, kind, text, doc "
+                "FROM symbols WHERE doc != ''"
+            )
+        ]
+        if not docs:
+            return None
+        words = [set(TOKEN_RE.findall(row[5].lower())) for row in docs]
+        frequency = {
+            term: sum(1 for wordset in words if term_matches(term, wordset))
+            for term in prose_terms
+        }
+        distinctive = max(2, len(docs) // 20)
+
+        # Rarity weighting, not a raw overlap count: a doc that merely mentions
+        # "message", "turn" and "name" is worth less than one whose words are
+        # specific to the question. That is what keeps a long module docstring
+        # from beating the comment on the constant being asked about.
+        best: tuple[float, int, tuple[str, int, int, str, str]] | None = None
+        for row, wordset in zip(docs, words):
+            matched = [term for term in prose_terms if term_matches(term, wordset)]
+            if len(matched) < PROSE_MIN_OVERLAP:
+                continue
+            if not any(frequency[term] <= distinctive for term in matched):
+                continue
+            rarity = sum(1.0 / frequency[term] for term in matched)
+            if (
+                best is None
+                or rarity > best[0] + 1e-9
+                or (abs(rarity - best[0]) <= 1e-9 and len(row[4]) < len(best[2][4]))
+            ):
+                best = (rarity, len(matched), row[:5])
+        if best is None:
+            return None
+        rarity, overlap, (path, start, end, _kind, text) = best
+        return Chunk(
+            path, start, end, text, SYMBOL_PROSE_SCORE + overlap, "symbol"
+        )
+
     def search(
         self,
         query: str,
         *,
-        limit: int = 5,
+        limit: int = DEFAULT_RETRIEVAL_LIMIT,
         min_score: float = DEFAULT_MIN_SCORE,
         min_coverage: int = DEFAULT_MIN_COVERAGE,
         max_chars: int = DEFAULT_MAX_CHARS,
@@ -409,21 +819,17 @@ class RepoIndex:
             ).fetchone()[0]
             if not total:
                 return []
-            # Rare terms carry the signal; "code" and "file" are everywhere and
-            # would otherwise outvote the one identifier that matters.
-            weights: dict[str, float] = {}
-            for term in terms:
-                found = connection.execute(
-                    "SELECT COUNT(*) FROM chunks WHERE chunks MATCH ?",
-                    (f'"{term}"',),
-                ).fetchone()[0]
-                weights[term] = math.log((total + 1) / (found + 1)) + 1.0
+            weights = self._term_weights(connection, terms)
             rows = connection.execute(
                 "SELECT path, start_line, end_line, kind, text, "
                 "bm25(chunks) AS rank "
                 "FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?",
                 (match, limit * 10),
             ).fetchall()
+            # Definitions beat prose: an exact or prefix name match is stronger
+            # evidence than shared words, so it is scored above every bm25 hit
+            # and is not subject to the coverage gate.
+            symbol_hits, prose_hit = self._symbol_lookup(connection, query, limit)
         except sqlite3.Error as exc:
             raise IndexUnavailableError(
                 f"cannot read index {self.db_path}: {exc}; {self._rebuild_hint()}"
@@ -451,6 +857,14 @@ class RepoIndex:
         kept: list[Chunk] = []
         seen_paths: set[str] = set()
         used = 0
+        for hit in symbol_hits:
+            if used + len(hit.text) > max_chars:
+                continue
+            kept.append(hit)
+            seen_paths.add(hit.path)
+            used += len(hit.text)
+            if len(kept) >= limit:
+                break
         for _weight, _coverage, score, path, start, end, kind, text in scored:
             # A file's best chunk is enough; symbol chunks rank higher, so they
             # win over the window that contains them.
@@ -463,6 +877,16 @@ class RepoIndex:
             used += len(text)
             if len(kept) >= limit:
                 break
+
+        # A docstring match is the weakest evidence, so it is offered only when
+        # the chunks that matched the question's own words left room.
+        if (
+            prose_hit is not None
+            and len(kept) < limit
+            and prose_hit.path not in seen_paths
+            and used + len(prose_hit.text) <= max_chars
+        ):
+            kept.append(prose_hit)
         return kept
 
 
@@ -502,7 +926,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "search", parents=[common], help="print matching chunks"
     )
     search.add_argument("query")
-    search.add_argument("--limit", type=int, default=5)
+    search.add_argument("--limit", type=int, default=DEFAULT_RETRIEVAL_LIMIT)
     search.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     search.add_argument(
         "--min-coverage", type=int, default=DEFAULT_MIN_COVERAGE
